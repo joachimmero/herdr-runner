@@ -17,6 +17,8 @@ tests in the Editor you already have open.
 - macOS, herdr 0.9.3 or later.
 - The [`unity` CLI](https://docs.unity.com) on `PATH` or in `~/.unity/bin`.
 - The project has the Pipeline package (`com.unity.pipeline`) installed and its Editor open.
+- `cargo`, to build the plugin. Install it with [rustup](https://rustup.rs); the first build
+  fetches the Rust version pinned in `rust-toolchain.toml`.
 
 ## Install (local)
 
@@ -24,7 +26,8 @@ tests in the Editor you already have open.
 scripts/link.sh
 ```
 
-That builds the release binary, links `bin/herdr-runner` to it, and runs `herdr plugin link`.
+That builds the release binary with `cargo` (which must be on `PATH`), links `bin/herdr-runner`
+to it, and runs `herdr plugin link`.
 Then bind the toggle to a key in herdr's `config.toml`:
 
 ```toml
