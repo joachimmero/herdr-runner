@@ -1,0 +1,12 @@
+[package]
+name = "herdr-runner"
+version = "0.1.0"
+edition = "2024"
+description = "A herdr pane for browsing and running Unity Test Runner tests in the open Editor."
+license = "MIT"
+publish = false
+
+[dependencies]
+ratatui = "0.30"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

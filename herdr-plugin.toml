@@ -1,0 +1,31 @@
+id = "joachimmero.herdr-runner"
+name = "herdr-runner"
+version = "0.1.0"
+# 0.9.0 resolves pane commands against the plugin root.
+min_herdr_version = "0.9.3"
+platforms = ["macos"]
+description = "Browse and run Unity Test Runner tests in the open Editor from a pane beside the chat."
+
+[[panes]]
+id = "pane"
+title = "herdr-runner"
+placement = "split"
+command = ["bin/herdr-runner"]
+
+[[actions]]
+id = "toggle"
+title = "herdr-runner: toggle pane"
+contexts = ["pane", "workspace"]
+command = ["bin/herdr-runner", "--action", "toggle"]
+
+[[actions]]
+id = "open"
+title = "herdr-runner: open pane"
+contexts = ["pane", "workspace"]
+command = ["bin/herdr-runner", "--action", "open"]
+
+[[actions]]
+id = "close"
+title = "herdr-runner: close pane"
+contexts = ["pane", "workspace"]
+command = ["bin/herdr-runner", "--action", "close"]
