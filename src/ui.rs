@@ -41,6 +41,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
         }
         None => (body, None),
     };
+    app.tree_height.set(tree_area.height);
 
     frame.render_widget(Paragraph::new(header_line(app)), header);
     draw_tree(frame, app, tree_area);

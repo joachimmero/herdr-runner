@@ -46,6 +46,7 @@ directory.
 | Key | Does |
 | --- | --- |
 | `j` `k` / `↓` `↑` | Move |
+| `Ctrl+d` `Ctrl+u` | Move half a page down, up |
 | `l` `h` / `→` `←`, `space` | Open, close, toggle a branch |
 | `⏎` | Run the selection |
 | `a` | Run everything (explicit tests excluded) |

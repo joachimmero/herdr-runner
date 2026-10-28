@@ -1,5 +1,6 @@
 //! The pane: its state, its keys, and the loop that ties them to the worker.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -53,6 +54,8 @@ pub struct App {
     pub busy: Option<Busy>,
     pub notice: Option<Notice>,
     pub detail_scroll: u16,
+    /// Rows the tree had on screen at the last draw, for moving by half a page.
+    pub tree_height: Cell<u16>,
     editor: Editor,
     jobs: Sender<Job>,
     updates: Receiver<Update>,
@@ -94,6 +97,17 @@ fn is_quit(key: &KeyEvent) -> bool {
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
+fn half_page_direction(key: &KeyEvent) -> Option<isize> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('d') => Some(1),
+        KeyCode::Char('u') => Some(-1),
+        _ => None,
+    }
+}
+
 const TICK: Duration = Duration::from_millis(100);
 
 impl App {
@@ -115,6 +129,7 @@ impl App {
             busy: None,
             notice: None,
             detail_scroll: 0,
+            tree_height: Cell::new(0),
             jobs,
             updates,
             cancel,
@@ -161,6 +176,11 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if let Some(direction) = half_page_direction(&key) {
+            let half_page = (self.tree_height.get() / 2).max(1) as isize;
+            self.move_by(direction * half_page);
+            return;
+        }
         if self.editing_filter {
             self.on_filter_key(key);
             return;
@@ -462,6 +482,10 @@ mod tests {
         }
     }
 
+    fn ctrl(app: &mut App, ch: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL));
+    }
+
     fn select(app: &mut App, wanted: impl Fn(&Tree, Row) -> bool) {
         let tree = app.tree.as_ref().unwrap();
         app.selected =
@@ -501,7 +525,11 @@ mod tests {
     }
 
     fn screen(app: &App) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        screen_of_height(app, 30)
+    }
+
+    fn screen_of_height(app: &App, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, height)).unwrap();
         terminal.draw(|frame| ui::draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -721,6 +749,38 @@ mod tests {
         assert!(!app.editing_filter);
         press(&mut app, "q");
         assert!(app.quit);
+    }
+
+    #[test]
+    fn ctrl_d_and_ctrl_u_move_by_half_the_tree_and_stop_at_its_ends() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        assert_eq!(app.rows().len(), 6);
+        // A header and a footer leave the tree four rows.
+        screen_of_height(&app, 6);
+
+        ctrl(&mut app, 'd');
+        assert_eq!(app.selected, 2);
+        ctrl(&mut app, 'd');
+        ctrl(&mut app, 'd');
+        assert_eq!(app.selected, 5);
+        ctrl(&mut app, 'u');
+        assert_eq!(app.selected, 3);
+        ctrl(&mut app, 'u');
+        ctrl(&mut app, 'u');
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn ctrl_d_moves_while_typing_a_filter_instead_of_typing() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        screen_of_height(&app, 6);
+        press(&mut app, "/game");
+        ctrl(&mut app, 'd');
+        assert_eq!(app.filter, "game");
+        assert!(app.editing_filter);
+        assert_eq!(app.selected, 2);
     }
 
     #[test]
