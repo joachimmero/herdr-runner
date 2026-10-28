@@ -56,6 +56,9 @@ pub struct App {
     pub detail_scroll: u16,
     /// Rows the tree had on screen at the last draw, for moving by half a page.
     pub tree_height: Cell<u16>,
+    /// The tree's first row on screen at the last draw, so the view moves only when the
+    /// selection would leave it.
+    pub tree_offset: Cell<usize>,
     editor: Editor,
     jobs: Sender<Job>,
     updates: Receiver<Update>,
@@ -130,6 +133,7 @@ impl App {
             notice: None,
             detail_scroll: 0,
             tree_height: Cell::new(0),
+            tree_offset: Cell::new(0),
             jobs,
             updates,
             cancel,
@@ -769,6 +773,40 @@ mod tests {
         ctrl(&mut app, 'u');
         ctrl(&mut app, 'u');
         assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn the_tree_scrolls_only_when_the_selection_would_leave_the_screen() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        // Six rows in a four-row tree.
+        screen_of_height(&app, 6);
+
+        press(&mut app, "G");
+        screen_of_height(&app, 6);
+        assert_eq!(app.tree_offset.get(), 2);
+        press(&mut app, "kkk");
+        screen_of_height(&app, 6);
+        assert_eq!(app.tree_offset.get(), 2);
+        press(&mut app, "k");
+        screen_of_height(&app, 6);
+        assert_eq!(app.tree_offset.get(), 1);
+        press(&mut app, "jjjj");
+        screen_of_height(&app, 6);
+        assert_eq!(app.tree_offset.get(), 2);
+    }
+
+    #[test]
+    fn the_tree_pulls_back_to_fill_a_taller_screen() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        screen_of_height(&app, 6);
+        press(&mut app, "G");
+        screen_of_height(&app, 6);
+        assert_eq!(app.tree_offset.get(), 2);
+
+        screen_of_height(&app, 7);
+        assert_eq!(app.tree_offset.get(), 1);
     }
 
     #[test]

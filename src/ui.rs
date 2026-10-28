@@ -136,8 +136,11 @@ fn draw_tree(frame: &mut Frame, app: &App, area: Rect) {
     let items: Vec<ListItem> =
         rows.iter().map(|&row| ListItem::new(row_line(app, tree, row))).collect();
     let list = List::new(items).highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut state = ListState::default().with_selected(Some(app.selected));
+    // Pulled back so a list that got shorter, or a taller pane, still fills the screen.
+    let offset = app.tree_offset.get().min(rows.len().saturating_sub(area.height as usize));
+    let mut state = ListState::default().with_selected(Some(app.selected)).with_offset(offset);
     frame.render_stateful_widget(list, area, &mut state);
+    app.tree_offset.set(state.offset());
 }
 
 /// The combined state of some tests, worst first.
