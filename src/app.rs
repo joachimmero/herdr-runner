@@ -199,6 +199,7 @@ impl App {
                 self.editing_filter = false;
                 self.set_filter(String::new());
             }
+            KeyCode::Backspace if self.filter.is_empty() => self.editing_filter = false,
             KeyCode::Backspace => {
                 let mut filter = self.filter.clone();
                 filter.pop();
@@ -454,6 +455,7 @@ mod tests {
             let code = match ch {
                 '\n' => KeyCode::Enter,
                 '\u{1b}' => KeyCode::Esc,
+                '\u{8}' => KeyCode::Backspace,
                 ch => KeyCode::Char(ch),
             };
             app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
@@ -706,6 +708,19 @@ mod tests {
         assert!(!app.quit);
         assert_eq!(app.mode, Mode::EditMode);
         assert!(app.busy.is_none());
+    }
+
+    #[test]
+    fn backspace_on_an_empty_filter_leaves_it() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "/ab\u{8}\u{8}");
+        assert!(app.editing_filter);
+        assert!(app.filter.is_empty());
+        press(&mut app, "\u{8}");
+        assert!(!app.editing_filter);
+        press(&mut app, "q");
+        assert!(app.quit);
     }
 
     #[test]

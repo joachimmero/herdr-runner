@@ -49,7 +49,7 @@ directory.
 | `f` | Re-run the current mode's failures |
 | `m` | Switch EditMode / PlayMode |
 | `c` | Cancel the run |
-| `/` | Filter by name (`⏎` keeps it, `Esc` clears it) |
+| `/` | Filter by name (`⏎` keeps it, `Esc` clears it, `⌫` on an empty filter leaves it) |
 | `r` | Reload the test list |
 | `J` `K` | Scroll the failure detail |
 | `Esc` | Dismiss a notice |
