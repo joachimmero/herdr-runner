@@ -415,3 +415,347 @@ impl App {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use serde_json::{Value, json};
+
+    use super::*;
+    use crate::fake::{FakeEditor, suite};
+
+    fn app(fake: &FakeEditor) -> App {
+        let mut app = App::new(fake.project(), fake.editor());
+        settle(&mut app);
+        app
+    }
+
+    /// Apply updates until the job in flight is over.
+    fn settle(app: &mut App) {
+        while app.busy.is_some() {
+            let update =
+                app.updates.recv_timeout(Duration::from_secs(20)).expect("job never ended");
+            app.on_update(update);
+        }
+    }
+
+    /// Apply updates until the run reaches its `Running` phase.
+    fn until_running(app: &mut App) {
+        while !app.busy.as_ref().is_some_and(|busy| matches!(busy.phase, Phase::Running { .. })) {
+            let update = app.updates.recv_timeout(Duration::from_secs(20)).expect("never ran");
+            app.on_update(update);
+        }
+    }
+
+    fn press(app: &mut App, keys: &str) {
+        for ch in keys.chars() {
+            let code = match ch {
+                '\n' => KeyCode::Enter,
+                '\u{1b}' => KeyCode::Esc,
+                ch => KeyCode::Char(ch),
+            };
+            app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+    }
+
+    fn select(app: &mut App, wanted: impl Fn(&Tree, Row) -> bool) {
+        let tree = app.tree.as_ref().unwrap();
+        app.selected =
+            app.rows().into_iter().position(|row| wanted(tree, row)).expect("no such row");
+    }
+
+    fn select_fixture(app: &mut App, name: &str) {
+        select(
+            app,
+            |tree, row| matches!(row, Row::Fixture(a, f) if tree.fixture(a, f).name == name),
+        );
+    }
+
+    fn select_test(app: &mut App, full_name: &str) {
+        let (assembly, fixture) = {
+            let tree = app.tree.as_ref().unwrap();
+            let (a, f) = tree
+                .assemblies
+                .iter()
+                .enumerate()
+                .flat_map(|(a, assembly)| (0..assembly.fixtures.len()).map(move |f| (a, f)))
+                .find(|&(a, f)| {
+                    tree.fixture(a, f).tests.iter().any(|test| test.full_name == full_name)
+                })
+                .unwrap();
+            (tree.assembly(a).name.clone(), tree.fixture(a, f).name.clone())
+        };
+        app.expansion.set_fixture(&assembly, &fixture, true);
+        select(
+            app,
+            |tree, row| matches!(row, Row::Test(a, f, t) if tree.test(a, f, t).full_name == full_name),
+        );
+    }
+
+    fn is_running(app: &App, full_name: &str) -> bool {
+        matches!(app.marks().and_then(|marks| marks.get(full_name)), Some(Mark::Running))
+    }
+
+    fn screen(app: &App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn opening_lists_the_tree_with_fixtures_closed() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let app = app(&fake);
+        let tree = app.tree.as_ref().unwrap();
+        let assemblies: Vec<&str> = tree.assemblies.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(assemblies, ["Game.Tests", "Words.Tests"]);
+        assert!(app.rows().iter().all(|row| !matches!(row, Row::Test(..))));
+        assert!(app.notice.is_none());
+        assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn running_a_fixture_marks_exactly_what_unity_will_run() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 3}));
+        let mut app = app(&fake);
+        select_fixture(&mut app, "Game.BoardTests");
+        press(&mut app, "\n");
+
+        assert!(is_running(&app, "Game.BoardTests.PlacesTile"));
+        assert!(is_running(&app, "Game.BoardTests.RejectsOverlap"));
+        assert!(!is_running(&app, "Game.BoardTestsExtra.Scores(1.5)"));
+        settle(&mut app);
+
+        assert_eq!(app.verdict("Game.BoardTests.PlacesTile"), Some(Verdict::Passed));
+        assert_eq!(app.verdict("Game.BoardTests.RejectsOverlap"), Some(Verdict::Failed));
+        assert_eq!(app.verdict("Game.BoardTestsExtra.Scores(1.5)"), None);
+        // The fixture holding the failure opens, so the failure is one move away.
+        assert!(app.expansion.is_fixture_open("Game.Tests", "Game.BoardTests"));
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn a_selected_failure_shows_its_message_and_trace() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        settle(&mut app);
+        select_test(&mut app, "Game.BoardTests.RejectsOverlap");
+
+        let screen = screen(&app);
+        assert!(screen.contains("Game.BoardTests.RejectsOverlap"), "{screen}");
+        assert!(screen.contains("Expected: 1"), "{screen}");
+        assert!(screen.contains("BoardTests.cs:42"), "{screen}");
+        assert!(screen.contains("✓ 3  ✗ 1  of 5"), "{screen}");
+    }
+
+    #[test]
+    fn rerunning_failures_runs_each_failed_test_by_name() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        settle(&mut app);
+        press(&mut app, "f");
+        settle(&mut app);
+
+        let filters: Vec<Value> = fake.runs().iter().map(|run| run["filter"].clone()).collect();
+        assert_eq!(filters, [Value::Null, json!("Game.BoardTests.RejectsOverlap")]);
+        assert_eq!(app.verdict("Game.BoardTests.RejectsOverlap"), Some(Verdict::Failed));
+        // Results from the first run survive the second.
+        assert_eq!(app.verdict("Words.DictionaryTests.Loads"), Some(Verdict::Passed));
+    }
+
+    #[test]
+    fn rerunning_with_no_failures_says_so() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "f");
+        assert!(
+            matches!(&app.notice, Some(Notice::Info(message)) if message.contains("No EditMode failures"))
+        );
+        assert!(app.busy.is_none());
+        assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn running_an_explicit_test_by_selection_includes_it() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        select_test(&mut app, "Game.Sim.RunsForever");
+        press(&mut app, "\n");
+        settle(&mut app);
+        assert_eq!(fake.runs()[0]["include_explicit"], "true");
+        assert_eq!(app.verdict("Game.Sim.RunsForever"), Some(Verdict::Passed));
+    }
+
+    #[test]
+    fn a_fixture_with_only_an_explicit_test_never_counts_it_as_expected() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 100_000}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        assert!(!is_running(&app, "Game.Sim.RunsForever"));
+        assert!(is_running(&app, "Words.DictionaryTests.Loads"));
+        press(&mut app, "c");
+        settle(&mut app);
+    }
+
+    #[test]
+    fn a_compile_failure_shows_the_errors_and_clears_the_running_marks() {
+        let errors = ["Assets/Board.cs(3,1): error CS1002: ; expected"];
+        let fake = FakeEditor::new(
+            json!({"tests": suite(), "compile": {"start": "failed", "errors": errors}}),
+        );
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        settle(&mut app);
+
+        assert!(matches!(&app.notice, Some(Notice::CompileErrors(shown)) if shown == &errors));
+        assert!(!is_running(&app, "Game.BoardTests.PlacesTile"));
+        let screen = screen(&app);
+        assert!(screen.contains("Compile errors (1)"), "{screen}");
+        assert!(screen.contains("error CS1002"), "{screen}");
+
+        press(&mut app, "\u{1b}");
+        assert!(app.notice.is_none());
+    }
+
+    #[test]
+    fn cancelling_stops_the_run_and_clears_the_running_marks() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 100_000}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        until_running(&mut app);
+        press(&mut app, "c");
+        settle(&mut app);
+
+        assert!(matches!(&app.notice, Some(Notice::Info(message)) if message == "Run cancelled."));
+        assert!(app.marks().unwrap().is_empty());
+        assert!(fake.commands().contains(&"cancel_tests".to_owned()));
+    }
+
+    #[test]
+    fn a_second_run_is_ignored_while_one_is_going() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 5}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        press(&mut app, "af\n");
+        settle(&mut app);
+        assert_eq!(fake.runs().len(), 1);
+    }
+
+    #[test]
+    fn switching_mode_lists_the_other_suite_and_keeps_each_modes_results() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        settle(&mut app);
+        press(&mut app, "m");
+        settle(&mut app);
+
+        assert_eq!(app.mode, Mode::PlayMode);
+        assert_eq!(app.tree.as_ref().unwrap().tests().count(), 1);
+        assert_eq!(fake.calls().last().unwrap()["args"]["mode"], "playmode");
+        press(&mut app, "a");
+        settle(&mut app);
+        assert_eq!(fake.runs().last().unwrap()["mode"], "playmode");
+        assert_eq!(app.verdict("Game.PlayTests.Boots"), Some(Verdict::Passed));
+
+        press(&mut app, "m");
+        settle(&mut app);
+        assert_eq!(app.verdict("Game.BoardTests.RejectsOverlap"), Some(Verdict::Failed));
+    }
+
+    #[test]
+    fn switching_mode_waits_for_the_job_in_flight() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 5}));
+        let mut app = app(&fake);
+        press(&mut app, "am");
+        assert_eq!(app.mode, Mode::EditMode);
+        assert!(matches!(&app.notice, Some(Notice::Info(_))));
+        settle(&mut app);
+    }
+
+    #[test]
+    fn the_filter_narrows_the_tree_and_enter_runs_what_is_selected() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "/DICT\n");
+        assert!(!app.editing_filter);
+        assert_eq!(app.rows(), [Row::Assembly(1), Row::Fixture(1, 0), Row::Test(1, 0, 0)]);
+        press(&mut app, "jj\n");
+        settle(&mut app);
+        assert_eq!(fake.runs()[0]["filter"], "Words.DictionaryTests.Loads");
+
+        press(&mut app, "\u{1b}");
+        assert!(app.filter.is_empty());
+        assert!(app.rows().len() > 3);
+    }
+
+    #[test]
+    fn typing_in_the_filter_does_not_trigger_keys() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "/aqmfc");
+        assert_eq!(app.filter, "aqmfc");
+        assert!(!app.quit);
+        assert_eq!(app.mode, Mode::EditMode);
+        assert!(app.busy.is_none());
+    }
+
+    #[test]
+    fn closing_from_a_test_lands_on_its_fixture() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        select_test(&mut app, "Game.BoardTests.RejectsOverlap");
+        press(&mut app, "h");
+        assert!(!app.expansion.is_fixture_open("Game.Tests", "Game.BoardTests"));
+        let tree = app.tree.as_ref().unwrap();
+        let row = app.selected_row().unwrap();
+        assert!(matches!(row, Row::Fixture(a, f) if tree.fixture(a, f).name == "Game.BoardTests"));
+    }
+
+    #[test]
+    fn an_unreachable_editor_shows_an_error_and_retries_on_r() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "flaky": {"editor_status": 1}}));
+        let mut app = app(&fake);
+        assert!(
+            matches!(&app.notice, Some(Notice::Error(message)) if message.contains("No Unity Editor"))
+        );
+        assert!(app.tree.is_none());
+        assert!(screen(&app).contains("No test listing. r to retry."));
+
+        press(&mut app, "r");
+        settle(&mut app);
+        assert!(app.tree.is_some());
+    }
+
+    #[test]
+    fn quitting_mid_run_cancels_it_in_the_editor() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 100_000}));
+        let mut app = app(&fake);
+        press(&mut app, "a");
+        until_running(&mut app);
+        while fake.runs().is_empty() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        press(&mut app, "q");
+        assert!(app.quit);
+        app.shut_down();
+        assert_eq!(fake.commands().last().unwrap(), "cancel_tests");
+    }
+
+    #[test]
+    fn quitting_while_idle_leaves_the_editor_alone() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let mut app = app(&fake);
+        press(&mut app, "q");
+        app.shut_down();
+        assert!(!fake.commands().contains(&"cancel_tests".to_owned()));
+    }
+}

@@ -66,3 +66,11 @@ These come from the Pipeline package's test commands:
   example `run_tests` without `--async_tests`) can't be seen, and starting a run from the pane
   replaces it.
 
+## Development
+
+```sh
+cargo test
+```
+
+The tests run the plugin against scripted stand-ins for the Editor (`tests/fakes/unity.py`) and
+for herdr (`tests/fakes/herdr.py`), so they need `python3` but no Editor.

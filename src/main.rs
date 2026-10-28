@@ -1,5 +1,7 @@
 mod actions;
 mod app;
+#[cfg(test)]
+mod fake;
 mod herdr;
 mod project;
 mod runner;
