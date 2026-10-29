@@ -1,7 +1,7 @@
 //! The plugin's toggle, open, and close actions on the invoking workspace's runner pane.
 
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -48,26 +48,36 @@ fn act(action: Action) -> Result<String, String> {
     // Held through the close or open, so two quick toggles can't both open a pane.
     let _lock = lock(&ws)?;
 
-    let panes = herdr::call(&["pane", "list", "--workspace", &ws])?;
-    let panes = panes["panes"].as_array().cloned().unwrap_or_default();
-    let ids: Vec<String> = panes.iter().filter_map(|pane| text(pane, "/pane_id")).collect();
-    let open: Vec<&String> = ids.iter().filter(|pane| runs_runner(pane)).collect();
-
+    let (panes, open) = panes(&ws)?;
     match (action, open.is_empty()) {
         (Action::Toggle | Action::Close, false) => {
             open.iter().try_for_each(|pane| herdr::call(&["pane", "close", pane]).map(drop))?;
-            Ok(format!(
-                "closed {}",
-                open.iter().map(|pane| pane.as_str()).collect::<Vec<_>>().join(" ")
-            ))
+            Ok(format!("closed {}", open.join(" ")))
         }
         (Action::Open, false) => Ok(format!("already open ({})", open[0])),
         (Action::Close, true) => Ok("nothing open".into()),
-        (Action::Toggle | Action::Open, true) => open_pane(&ws, &context, &panes),
+        (Action::Toggle | Action::Open, true) => {
+            let (target, root) = placement(&ws, &context, &panes)?;
+            let pane = open_beside(&target, &root, true)?;
+            Ok(format!("opened {pane} for {}", root.display()))
+        }
     }
 }
 
-fn open_pane(ws: &str, context: &Value, panes: &[Value]) -> Result<String, String> {
+/// Workspace `ws`'s panes, and the ids of those showing the runner.
+fn panes(ws: &str) -> Result<(Vec<Value>, Vec<String>), String> {
+    let panes = herdr::call(&["pane", "list", "--workspace", ws])?;
+    let panes = panes["panes"].as_array().cloned().unwrap_or_default();
+    let open = panes
+        .iter()
+        .filter_map(|pane| text(pane, "/pane_id"))
+        .filter(|pane| runs_runner(pane))
+        .collect();
+    Ok((panes, open))
+}
+
+/// The pane to split beside, and the project the new pane is for.
+fn placement(ws: &str, context: &Value, panes: &[Value]) -> Result<(String, PathBuf), String> {
     let focused = text(context, "/focused_pane_id").or_else(|| var("HERDR_PANE_ID"));
     // The focused pane's live cwd wins over the workspace's, when it is inside a project.
     let live = focused.as_deref().and_then(|focused| {
@@ -88,10 +98,14 @@ fn open_pane(ws: &str, context: &Value, panes: &[Value]) -> Result<String, Strin
     let target = focused
         .or_else(|| panes.first().and_then(|pane| text(pane, "/pane_id")))
         .ok_or_else(|| format!("no pane to split in {ws}"))?;
-    let plugin = var("HERDR_PLUGIN_ID").unwrap_or_else(|| "joachimmero.herdr-runner".into());
-    let root = root.to_string_lossy();
+    Ok((target, root))
+}
 
-    let opened = herdr::call(&[
+/// Open a runner pane for `root` as a split to the right of pane `target`, returning its id.
+fn open_beside(target: &str, root: &Path, focus: bool) -> Result<String, String> {
+    let plugin = herdr::plugin_id();
+    let root = root.to_string_lossy();
+    let mut args = vec![
         "plugin",
         "pane",
         "open",
@@ -102,15 +116,18 @@ fn open_pane(ws: &str, context: &Value, panes: &[Value]) -> Result<String, Strin
         "--placement",
         "split",
         "--target-pane",
-        &target,
+        target,
         "--direction",
         "right",
         "--cwd",
         &root,
-        "--focus",
-    ])?;
-    let pane = text(&opened, "/plugin_pane/pane/pane_id").unwrap_or_else(|| "a pane".into());
-    Ok(format!("opened {pane} for {root}"))
+    ];
+    if focus {
+        args.push("--focus");
+    }
+    let opened = herdr::call(&args)?;
+    text(&opened, "/plugin_pane/pane/pane_id")
+        .ok_or_else(|| format!("herdr opened a pane for {root} without naming it"))
 }
 
 /// Whether pane `pane`'s foreground is the runner's UI rather than one of its actions.
@@ -132,13 +149,10 @@ fn runs_runner(pane: &str) -> bool {
 const BINARY: &str = env!("CARGO_PKG_NAME");
 
 fn lock(ws: &str) -> Result<File, String> {
-    let dir = var("HERDR_PLUGIN_STATE_DIR")
-        .ok_or("no plugin state dir (invoke as a herdr plugin action)")?;
-    std::fs::create_dir_all(&dir).map_err(|error| format!("cannot create {dir}: {error}"))?;
-    // Workspace ids hold characters like `:`, so the file name keeps only the safe ones.
-    let name: String =
-        ws.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect();
-    let path = Path::new(&dir).join(format!("action-{name}.lock"));
+    let dir = herdr::state_dir()?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
+    let path = dir.join(format!("action-{}.lock", herdr::file_safe(ws)));
     let file = File::options()
         .read(true)
         .write(true)

@@ -1,6 +1,7 @@
 //! The herdr CLI, which is the whole plugin API.
 
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
@@ -29,4 +30,26 @@ pub fn call(args: &[&str]) -> Result<Value, String> {
 
 pub fn var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+pub fn plugin_id() -> String {
+    var("HERDR_PLUGIN_ID").unwrap_or_else(|| "joachimmero.herdr-runner".into())
+}
+
+/// The plugin's state dir. herdr hands it to the pane and to actions but not to a shell running
+/// the binary directly, so there it is rebuilt from herdr's layout.
+pub fn state_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = var("HERDR_PLUGIN_STATE_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let state = var("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| var("HOME").map(|home| Path::new(&home).join(".local/state")))
+        .ok_or("no plugin state dir: neither HERDR_PLUGIN_STATE_DIR nor HOME is set")?;
+    Ok(state.join("herdr/plugins").join(plugin_id()))
+}
+
+/// `id` keeping only the characters a file name can safely hold; herdr ids contain `:`.
+pub fn file_safe(id: &str) -> String {
+    id.chars().map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' }).collect()
 }
