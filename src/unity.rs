@@ -6,12 +6,14 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::project;
+
 /// Which of the Test Runner's two suites a call addresses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Mode {
     EditMode,
     PlayMode,
@@ -52,7 +54,7 @@ pub struct TestItem {
 }
 
 /// A finished test's outcome, as the async run's status file reports it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestOutcome {
     #[serde(rename = "FullName", alias = "fullName")]
     pub full_name: String,
@@ -66,7 +68,7 @@ pub struct TestOutcome {
     pub stack_trace: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum Verdict {
     Passed,
     Failed,
@@ -203,7 +205,7 @@ impl Editor {
         }
         let status: Status = self.call_as("editor_status", &[], 30)?;
         if status.project_path.is_empty()
-            || same_dir(Path::new(&status.project_path), &self.project)
+            || project::same_dir(Path::new(&status.project_path), &self.project)
         {
             return Ok(());
         }
@@ -400,13 +402,6 @@ fn search_path() -> OsString {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
     let dirs = unity_dir().into_iter().chain(std::env::split_paths(&inherited));
     std::env::join_paths(dirs).unwrap_or(inherited)
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    match (a.canonicalize(), b.canonicalize()) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
-    }
 }
 
 fn text(value: &Value, key: &str) -> Option<String> {

@@ -11,6 +11,8 @@ tests in the Editor you already have open.
 - Switch between EditMode and PlayMode.
 - `[Explicit]` tests are listed and marked, skipped by broader runs, and run when selected directly.
 - Cancel a run in progress. If another client's async run holds the Editor, the pane waits for it.
+- Hand the pane a run from the command line, so a coding agent's test runs show where you can
+  watch them (see [Running from the command line](#running-from-the-command-line)).
 
 ## Requirements
 
@@ -58,6 +60,28 @@ directory.
 | `J` `K` | Scroll the failure detail |
 | `Esc` | Dismiss a notice |
 | `q` | Close the pane |
+
+## Running from the command line
+
+`herdr-runner run` hands a run to the pane, so a coding agent's test runs show in the pane as
+your own do:
+
+```sh
+bin/herdr-runner run [<name>] [--mode edit|play] [--timeout <seconds>]
+```
+
+- `<name>` is a test's full name, a fixture's, or an assembly's, matched exactly. Leave it out
+  to run everything. An unknown name fails and lists names it might have meant. Naming an
+  `[Explicit]` test runs it.
+- Run it from a herdr pane inside the project. It uses the workspace's runner pane, or opens one
+  beside the calling pane without taking focus.
+- The pane recompiles and relists before it looks up the name, so a test written moments ago
+  is found. Then it filters the tree to the target, selects it, and runs it. A run you or
+  another client already started goes first.
+- It blocks until the run ends and prints a summary line, then every failure with its full
+  message and stack trace. Exit codes: `0` all passed, `5` a test failed, `1` compile errors,
+  a cancelled run, or any other problem, `2` bad arguments.
+- `--timeout` defaults to 300 seconds. When it runs out, the pane is asked to cancel the run.
 
 ## Limits
 

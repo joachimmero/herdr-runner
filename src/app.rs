@@ -1,7 +1,7 @@
 //! The pane: its state, its keys, and the loop that ties them to the worker.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,10 +12,11 @@ use std::time::{Duration, Instant};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
+use crate::mailbox::{Mailbox, Request, Response};
 use crate::runner::{self, Ending, Job, Phase, Update};
 use crate::tree::{Expansion, Row, Tree};
 use crate::unity::{Editor, Mode, RunRequest, TestOutcome, Verdict};
-use crate::{project, ui};
+use crate::{herdr, project, ui};
 
 /// A test's state in the pane, which outlives the listing it came from.
 pub enum Mark {
@@ -41,6 +42,21 @@ pub enum BusyJob {
     Running,
 }
 
+/// A run posted to the mailbox that the pane is working on.
+struct Serving {
+    id: String,
+    name: Option<String>,
+    stage: Stage,
+    results: Vec<TestOutcome>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// Recompiling and relisting first, so a test written since the last listing can be found.
+    Refreshing,
+    Running,
+}
+
 pub struct App {
     pub project: PathBuf,
     pub mode: Mode,
@@ -60,6 +76,11 @@ pub struct App {
     /// selection would leave it.
     pub tree_offset: Cell<usize>,
     editor: Editor,
+    /// Where `herdr-runner run` posts runs for this pane; `None` outside herdr.
+    mailbox: Option<Mailbox>,
+    /// Posted runs waiting for the pane to be free, oldest first.
+    queue: VecDeque<(String, Request)>,
+    serving: Option<Serving>,
     jobs: Sender<Job>,
     updates: Receiver<Update>,
     cancel: Arc<AtomicBool>,
@@ -68,9 +89,12 @@ pub struct App {
 
 pub fn run() -> u8 {
     let cwd = std::env::current_dir().unwrap_or_default();
+    let mailbox = herdr::var("HERDR_PANE_ID").and_then(|pane| Mailbox::for_pane(&pane).ok());
     let mut terminal = ratatui::init();
     let outcome = match project::find_root(&cwd) {
-        Some(project) => App::new(project.clone(), Editor::new(project)).run(&mut terminal),
+        Some(project) => {
+            App::new(project.clone(), Editor::new(project), mailbox).run(&mut terminal)
+        }
         None => show_no_project(&mut terminal, &cwd),
     };
     ratatui::restore();
@@ -114,7 +138,7 @@ fn half_page_direction(key: &KeyEvent) -> Option<isize> {
 const TICK: Duration = Duration::from_millis(100);
 
 impl App {
-    fn new(project: PathBuf, editor: Editor) -> Self {
+    fn new(project: PathBuf, editor: Editor, mailbox: Option<Mailbox>) -> Self {
         let (jobs, job_rx) = mpsc::channel();
         let (update_tx, updates) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -122,6 +146,9 @@ impl App {
         let mut app = Self {
             project,
             editor,
+            mailbox,
+            queue: VecDeque::new(),
+            serving: None,
             mode: Mode::EditMode,
             tree: None,
             marks: HashMap::new(),
@@ -155,15 +182,22 @@ impl App {
             while let Ok(update) = self.updates.try_recv() {
                 self.on_update(update);
             }
+            self.serve_mailbox();
         }
         self.shut_down();
         Ok(())
     }
 
-    /// A run left going would keep the Editor busy after the pane is gone.
+    /// A run left going would keep the Editor busy after the pane is gone, and a client left
+    /// waiting would wait for nothing.
     fn shut_down(&self) {
         if self.busy.as_ref().is_some_and(|busy| matches!(busy.phase, Phase::Running { .. })) {
             let _ = self.editor.cancel_run();
+        }
+        let closed = Response::Failed { message: "the pane closed before the run finished".into() };
+        let serving = self.serving.iter().map(|serving| &serving.id);
+        for id in serving.chain(self.queue.iter().map(|(id, _)| id)) {
+            self.respond(id, &closed);
         }
     }
 
@@ -373,6 +407,119 @@ impl App {
         }
     }
 
+    /// Queue newly posted runs, drop withdrawn ones, and start the next once the pane is free.
+    fn serve_mailbox(&mut self) {
+        let Some(mailbox) = &self.mailbox else { return };
+        self.queue.extend(mailbox.take());
+        self.queue.retain(|(id, _)| {
+            let withdrawn = mailbox.is_withdrawn(id);
+            if withdrawn {
+                mailbox.clear(id);
+            }
+            !withdrawn
+        });
+        if self.serving.as_ref().is_some_and(|serving| mailbox.is_withdrawn(&serving.id)) {
+            self.cancel();
+        }
+        if self.serving.is_none()
+            && self.busy.is_none()
+            && let Some((id, request)) = self.queue.pop_front()
+        {
+            self.begin_serving(id, request);
+        }
+    }
+
+    fn begin_serving(&mut self, id: String, request: Request) {
+        if !project::same_dir(&request.project, &self.project) {
+            let message = format!(
+                "this pane is for {}, not {}",
+                self.project.display(),
+                request.project.display()
+            );
+            self.respond(&id, &Response::Failed { message });
+            return;
+        }
+        if request.mode != self.mode {
+            self.mode = request.mode;
+            self.tree = None;
+            self.select(0);
+        }
+        self.notice = None;
+        self.cancel.store(false, Ordering::Relaxed);
+        self.busy =
+            Some(Busy { job: BusyJob::Running, phase: Phase::Checking, since: Instant::now() });
+        let _ = self.jobs.send(Job::Run { mode: self.mode, requests: Vec::new() });
+        self.serving =
+            Some(Serving { id, name: request.name, stage: Stage::Refreshing, results: Vec::new() });
+    }
+
+    /// Take the run being served to its next stage once the pane's job for it ends.
+    fn advance_serving(&mut self, ending: &Ending) {
+        let Some(serving) = self.serving.take() else { return };
+        let response = match (serving.stage, ending) {
+            (Stage::Refreshing, Ending::Done) => return self.run_served(serving),
+            (Stage::Running, Ending::Done) => Response::Completed { results: serving.results },
+            (_, Ending::CompileFailed) => {
+                let errors = match &self.notice {
+                    Some(Notice::CompileErrors(errors)) => errors.clone(),
+                    _ => Vec::new(),
+                };
+                Response::CompileFailed { errors }
+            }
+            (_, Ending::Cancelled) => Response::Cancelled,
+            (_, Ending::Failed(message)) => Response::Failed { message: message.clone() },
+        };
+        self.respond(&serving.id, &response);
+    }
+
+    /// Filter the tree to the served run's target and select it, so the run shows, then run it.
+    fn run_served(&mut self, serving: Serving) {
+        let target = match (&self.tree, &serving.name) {
+            (None, _) => Err(Response::Failed { message: "the pane has no test listing".into() }),
+            (Some(_), None) => Ok(None),
+            (Some(tree), Some(name)) => tree
+                .find(name)
+                .map(|row| Some((row, filter_for(tree, row))))
+                .ok_or_else(|| Response::UnknownName { suggestions: tree.suggestions(name) }),
+        };
+        let target = match target {
+            Ok(target) => target,
+            Err(response) => return self.respond(&serving.id, &response),
+        };
+
+        self.editing_filter = false;
+        match target {
+            None => {
+                self.set_filter(String::new());
+                self.start_run(vec![RunRequest::all()]);
+            }
+            Some((row, filter)) => {
+                self.set_filter(filter);
+                let Some(index) = self.rows().iter().position(|shown| *shown == row) else {
+                    let message = "the filtered tree lost the row it was filtered to".into();
+                    return self.respond(&serving.id, &Response::Failed { message });
+                };
+                self.select(index);
+                self.run_selection();
+            }
+        }
+        // Nothing to run, as for a fixture holding only explicit tests.
+        if self.busy.is_none() {
+            return self.respond(&serving.id, &Response::Completed { results: Vec::new() });
+        }
+        self.serving = Some(Serving { stage: Stage::Running, ..serving });
+    }
+
+    /// Answer request `id`, or just clean up after it when its client has given up.
+    fn respond(&self, id: &str, response: &Response) {
+        let Some(mailbox) = &self.mailbox else { return };
+        if mailbox.is_withdrawn(id) {
+            mailbox.clear(id);
+        } else {
+            mailbox.respond(id, response);
+        }
+    }
+
     fn on_update(&mut self, update: Update) {
         match update {
             Update::Phase(phase) => {
@@ -386,8 +533,18 @@ impl App {
             }
             Update::Listed(..) => {}
             Update::CompileFailed(errors) => self.notice = Some(Notice::CompileErrors(errors)),
-            Update::Results(mode, outcomes) => self.record(mode, outcomes),
-            Update::Finished(ending) => self.finish(ending),
+            Update::Results(mode, outcomes) => {
+                if let Some(serving) = &mut self.serving
+                    && serving.stage == Stage::Running
+                {
+                    serving.results.extend(outcomes.iter().cloned());
+                }
+                self.record(mode, outcomes);
+            }
+            Update::Finished(ending) => {
+                self.finish(&ending);
+                self.advance_serving(&ending);
+            }
         }
     }
 
@@ -425,7 +582,7 @@ impl App {
         }
     }
 
-    fn finish(&mut self, ending: Ending) {
+    fn finish(&mut self, ending: &Ending) {
         self.busy = None;
         // A test marked running that no result came back for didn't run after all.
         for marks in self.marks.values_mut() {
@@ -434,9 +591,19 @@ impl App {
         match ending {
             Ending::Done | Ending::CompileFailed => {}
             Ending::Cancelled => self.notice = Some(Notice::Info("Run cancelled.".into())),
-            Ending::Failed(message) => self.notice = Some(Notice::Error(message)),
+            Ending::Failed(message) => self.notice = Some(Notice::Error(message.clone())),
         }
         self.select(self.selected);
+    }
+}
+
+/// The tree filter that shows `row` and as little else as it can: a fixture's trailing dot keeps
+/// out a fixture whose name extends it, and an assembly is its own branch already.
+fn filter_for(tree: &Tree, row: Row) -> String {
+    match row {
+        Row::Assembly(_) => String::new(),
+        Row::Fixture(a, f) => format!("{}.", tree.fixture(a, f).name),
+        Row::Test(a, f, t) => tree.test(a, f, t).full_name.clone(),
     }
 }
 
@@ -452,7 +619,7 @@ mod tests {
     use crate::fake::{FakeEditor, suite};
 
     fn app(fake: &FakeEditor) -> App {
-        let mut app = App::new(fake.project(), fake.editor());
+        let mut app = App::new(fake.project(), fake.editor(), None);
         settle(&mut app);
         app
     }
@@ -540,6 +707,188 @@ mod tests {
             .map(|y| (0..buffer.area.width).map(|x| buffer[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// A pane reading a mailbox, and the client's view of that same mailbox.
+    fn serving_app(fake: &FakeEditor) -> (App, Mailbox) {
+        let dir = fake.project().parent().unwrap().join("mailbox");
+        let mut app = App::new(fake.project(), fake.editor(), Some(Mailbox::at(dir.clone())));
+        settle(&mut app);
+        (app, Mailbox::at(dir))
+    }
+
+    fn post(fake: &FakeEditor, client: &Mailbox, mode: Mode, name: Option<&str>) -> String {
+        let request = Request { project: fake.project(), mode, name: name.map(str::to_owned) };
+        client.send(&request).unwrap()
+    }
+
+    /// Drive the pane as its loop does until `until` holds.
+    fn drive(app: &mut App, until: impl Fn(&App) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !until(app) {
+            assert!(Instant::now() < deadline, "the pane never got there");
+            app.serve_mailbox();
+            if let Ok(update) = app.updates.recv_timeout(Duration::from_millis(10)) {
+                app.on_update(update);
+            }
+        }
+    }
+
+    fn answer(app: &mut App, client: &Mailbox, id: &str) -> Response {
+        drive(app, |_| client.response(id).is_some());
+        client.response(id).unwrap()
+    }
+
+    fn verdicts(response: &Response) -> Vec<(String, Verdict)> {
+        match response {
+            Response::Completed { results } => {
+                results.iter().map(|outcome| (outcome.full_name.clone(), outcome.verdict)).collect()
+            }
+            other => panic!("expected results, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_posted_fixture_is_filtered_to_selected_and_run() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let (mut app, client) = serving_app(&fake);
+        let id = post(&fake, &client, Mode::EditMode, Some("Game.BoardTests"));
+        let response = answer(&mut app, &client, &id);
+
+        assert_eq!(
+            verdicts(&response),
+            [
+                ("Game.BoardTests.PlacesTile".to_owned(), Verdict::Passed),
+                ("Game.BoardTests.RejectsOverlap".to_owned(), Verdict::Failed),
+            ]
+        );
+        assert_eq!(fake.runs().last().unwrap()["filter"], "Game.BoardTests.");
+        // The trailing dot keeps the fixture whose name extends this one out of view.
+        assert_eq!(app.filter, "Game.BoardTests.");
+        let tree = app.tree.as_ref().unwrap();
+        let row = app.selected_row().unwrap();
+        assert!(matches!(row, Row::Fixture(a, f) if tree.fixture(a, f).name == "Game.BoardTests"));
+        // The pane recompiles and relists before it looks the name up.
+        assert_eq!(fake.commands().iter().filter(|command| *command == "recompile").count(), 2);
+    }
+
+    #[test]
+    fn a_posted_run_without_a_name_runs_everything() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let (mut app, client) = serving_app(&fake);
+        press(&mut app, "/dict\n");
+        let id = post(&fake, &client, Mode::EditMode, None);
+        let response = answer(&mut app, &client, &id);
+
+        assert_eq!(verdicts(&response).len(), 4);
+        assert!(app.filter.is_empty());
+        assert_eq!(fake.runs()[0]["filter"], Value::Null);
+    }
+
+    #[test]
+    fn a_posted_explicit_test_runs_when_named() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let (mut app, client) = serving_app(&fake);
+        let id = post(&fake, &client, Mode::EditMode, Some("Game.Sim.RunsForever"));
+        let response = answer(&mut app, &client, &id);
+
+        assert_eq!(verdicts(&response), [("Game.Sim.RunsForever".to_owned(), Verdict::Passed)]);
+        assert_eq!(fake.runs()[0]["include_explicit"], "true");
+    }
+
+    #[test]
+    fn an_unknown_posted_name_is_answered_with_suggestions_and_runs_nothing() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let (mut app, client) = serving_app(&fake);
+        let id = post(&fake, &client, Mode::EditMode, Some("Wrong.BoardTests"));
+        let response = answer(&mut app, &client, &id);
+
+        let Response::UnknownName { suggestions } = response else { panic!("{response:?}") };
+        assert!(suggestions.contains(&"Game.BoardTests".to_owned()), "{suggestions:?}");
+        assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn a_posted_play_mode_run_switches_the_pane_to_play_mode() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let (mut app, client) = serving_app(&fake);
+        let id = post(&fake, &client, Mode::PlayMode, Some("Game.PlayTests.Boots"));
+        let response = answer(&mut app, &client, &id);
+
+        assert_eq!(verdicts(&response), [("Game.PlayTests.Boots".to_owned(), Verdict::Passed)]);
+        assert_eq!(app.mode, Mode::PlayMode);
+        assert_eq!(fake.runs()[0]["mode"], "playmode");
+    }
+
+    #[test]
+    fn a_compile_failure_is_answered_with_the_errors() {
+        let errors = ["Assets/Board.cs(3,1): error CS1002: ; expected"];
+        let fake = FakeEditor::new(
+            json!({"tests": suite(), "compile": {"start": "failed", "errors": errors}}),
+        );
+        let (mut app, client) = serving_app(&fake);
+        let id = post(&fake, &client, Mode::EditMode, Some("Game.BoardTests"));
+        let response = answer(&mut app, &client, &id);
+
+        assert!(matches!(&response, Response::CompileFailed { errors: shown } if shown == &errors));
+        assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn a_posted_run_waits_for_the_one_already_going() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 5}));
+        let (mut app, client) = serving_app(&fake);
+        press(&mut app, "a");
+        let id = post(&fake, &client, Mode::EditMode, Some("Words.DictionaryTests.Loads"));
+        let response = answer(&mut app, &client, &id);
+
+        assert_eq!(verdicts(&response).len(), 1);
+        let filters: Vec<Value> = fake.runs().iter().map(|run| run["filter"].clone()).collect();
+        assert_eq!(filters, [Value::Null, json!("Words.DictionaryTests.Loads")]);
+    }
+
+    #[test]
+    fn a_posted_run_for_another_project_is_refused() {
+        let fake = FakeEditor::new(json!({"tests": suite()}));
+        let (mut app, client) = serving_app(&fake);
+        let request = Request { project: "/elsewhere".into(), mode: Mode::EditMode, name: None };
+        let id = client.send(&request).unwrap();
+        let response = answer(&mut app, &client, &id);
+
+        assert!(
+            matches!(&response, Response::Failed { message } if message.contains("not /elsewhere"))
+        );
+        assert!(fake.runs().is_empty());
+    }
+
+    #[test]
+    fn withdrawing_a_posted_run_cancels_it_and_cleans_up() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 100_000}));
+        let (mut app, client) = serving_app(&fake);
+        let id = post(&fake, &client, Mode::EditMode, None);
+        drive(&mut app, |_| !fake.runs().is_empty());
+        client.withdraw(&id);
+        drive(&mut app, |app| app.busy.is_none());
+
+        assert!(fake.commands().contains(&"cancel_tests".to_owned()));
+        assert!(client.response(&id).is_none());
+        assert!(!client.is_taken(&id) && !client.is_withdrawn(&id));
+    }
+
+    #[test]
+    fn closing_the_pane_answers_every_waiting_client() {
+        let fake = FakeEditor::new(json!({"tests": suite(), "run_polls": 100_000}));
+        let (mut app, client) = serving_app(&fake);
+        let first = post(&fake, &client, Mode::EditMode, None);
+        let second = post(&fake, &client, Mode::EditMode, Some("Game.BoardTests"));
+        drive(&mut app, |_| !fake.runs().is_empty());
+        app.shut_down();
+
+        for id in [first, second] {
+            assert!(
+                matches!(client.response(&id), Some(Response::Failed { message }) if message.contains("closed")),
+            );
+        }
     }
 
     #[test]

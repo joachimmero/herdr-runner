@@ -72,6 +72,8 @@ impl Expansion {
 /// Stands in for an assembly the listing didn't name.
 const UNKNOWN_ASSEMBLY: &str = "(unknown assembly)";
 
+const SUGGESTIONS: usize = 10;
+
 impl Tree {
     /// Fixtures sort by name; tests keep the order Unity listed them in.
     pub fn build(items: &[TestItem]) -> Self {
@@ -154,6 +156,49 @@ impl Tree {
         &self.assemblies[a].fixtures[f].tests[t]
     }
 
+    /// The row named exactly `name`: a test by full name first, then a fixture, then an assembly.
+    pub fn find(&self, name: &str) -> Option<Row> {
+        let rows = || {
+            self.assemblies.iter().enumerate().flat_map(|(a, assembly)| {
+                assembly.fixtures.iter().enumerate().map(move |(f, fixture)| (a, f, fixture))
+            })
+        };
+        let test = rows().find_map(|(a, f, fixture)| {
+            let t = fixture.tests.iter().position(|test| test.full_name == name)?;
+            Some(Row::Test(a, f, t))
+        });
+        let fixture = || {
+            rows()
+                .find(|(_, _, fixture)| !fixture.name.is_empty() && fixture.name == name)
+                .map(|(a, f, _)| Row::Fixture(a, f))
+        };
+        let assembly =
+            || self.assemblies.iter().position(|assembly| assembly.name == name).map(Row::Assembly);
+        test.or_else(fixture).or_else(assembly)
+    }
+
+    /// Names a caller may have meant by `name`: every test, fixture, and assembly whose name
+    /// contains its last segment, ignoring case, so a wrong namespace still finds the fixture.
+    pub fn suggestions(&self, name: &str) -> Vec<String> {
+        let needle = split_full_name(name).1.to_lowercase();
+        let assemblies = self.assemblies.iter().map(|assembly| assembly.name.as_str());
+        let fixtures = self
+            .assemblies
+            .iter()
+            .flat_map(|assembly| assembly.fixtures.iter().map(|fixture| fixture.name.as_str()));
+        let tests = self.tests().map(|(_, test)| test.full_name.as_str());
+        let mut seen = HashSet::new();
+        assemblies
+            .chain(fixtures)
+            .chain(tests)
+            .filter(|candidate| !candidate.is_empty())
+            .filter(|candidate| candidate.to_lowercase().contains(&needle))
+            .filter(|candidate| seen.insert(*candidate))
+            .take(SUGGESTIONS)
+            .map(str::to_owned)
+            .collect()
+    }
+
     /// The tests under `row`, itself included when it is one.
     pub fn tests_under(&self, row: Row) -> Vec<&TestNode> {
         match row {
@@ -224,6 +269,28 @@ mod tests {
         assert_eq!(tree.rows(&expansion, ""), [Row::Assembly(0), Row::Fixture(0, 0)]);
         expansion.set_fixture("Asm", "A.Fix", true);
         assert_eq!(tree.rows(&expansion, "").len(), 4);
+    }
+
+    #[test]
+    fn finds_a_test_then_a_fixture_then_an_assembly_by_exact_name() {
+        let tree = Tree::build(&[item("A.Fix.One", "Asm"), item("A.FixTwo.One", "A.Fix")]);
+        assert_eq!(tree.find("A.Fix.One"), Some(Row::Test(1, 0, 0)));
+        // A fixture wins over an assembly of the same name.
+        assert_eq!(tree.find("A.Fix"), Some(Row::Fixture(1, 0)));
+        assert_eq!(tree.find("Asm"), Some(Row::Assembly(1)));
+        assert_eq!(tree.find("a.fix.one"), None);
+        assert_eq!(tree.find("A.Fi"), None);
+    }
+
+    #[test]
+    fn suggests_names_holding_the_last_segment() {
+        let tree =
+            Tree::build(&[item("Game.BoardTests.Places", "Asm"), item("Game.Bag.Draws", "Asm")]);
+        assert_eq!(
+            tree.suggestions("Wrong.Namespace.BoardTests"),
+            ["Game.BoardTests", "Game.BoardTests.Places"]
+        );
+        assert_eq!(tree.suggestions("draws"), ["Game.Bag.Draws"]);
     }
 
     #[test]

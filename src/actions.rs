@@ -1,4 +1,5 @@
-//! The plugin's toggle, open, and close actions on the invoking workspace's runner pane.
+//! The plugin's toggle, open, and close actions on the invoking workspace's runner pane, and the
+//! find-or-open the `run` verb needs.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -61,6 +62,17 @@ fn act(action: Action) -> Result<String, String> {
             let pane = open_beside(&target, &root, true)?;
             Ok(format!("opened {pane} for {}", root.display()))
         }
+    }
+}
+
+/// The runner pane in workspace `ws`, opened beside pane `beside` for `root` when there is
+/// none, without taking the focus.
+pub fn find_or_open(ws: &str, root: &Path, beside: &str) -> Result<String, String> {
+    let _lock = lock(ws)?;
+    let (_, open) = panes(ws)?;
+    match open.into_iter().next() {
+        Some(pane) => Ok(pane),
+        None => open_beside(beside, root, false),
     }
 }
 
@@ -131,7 +143,7 @@ fn open_beside(target: &str, root: &Path, focus: bool) -> Result<String, String>
 }
 
 /// Whether pane `pane`'s foreground is the runner's UI rather than one of its actions.
-fn runs_runner(pane: &str) -> bool {
+pub fn runs_runner(pane: &str) -> bool {
     let Ok(info) = herdr::call(&["pane", "process-info", "--pane", pane]) else {
         return false;
     };
