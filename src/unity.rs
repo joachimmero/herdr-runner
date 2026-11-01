@@ -388,13 +388,17 @@ impl Editor {
 
 /// The CLI installs to `~/.unity/bin`, which a pane's non-login shell may not have on `PATH`.
 fn unity_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|home| Path::new(&home).join(".unity/bin"))
+    crate::herdr::home().map(|home| home.join(".unity/bin"))
 }
 
 fn unity_bin() -> PathBuf {
     unity_dir()
-        .map(|dir| dir.join("unity"))
-        .filter(|bin| bin.is_file())
+        .and_then(|dir| {
+            ["unity.exe", "unity.cmd", "unity"]
+                .into_iter()
+                .map(|name| dir.join(name))
+                .find(|bin| bin.is_file())
+        })
         .unwrap_or_else(|| PathBuf::from("unity"))
 }
 

@@ -19,7 +19,7 @@ fn start(ws: &Workspace, args: &[&str]) -> Child {
         .args(args)
         .current_dir(ws.project().join("Assets/Scripts"))
         .env("FAKE_HERDR_DIR", &ws.dir)
-        .env("HERDR_BIN_PATH", ws.dir.join("herdr"))
+        .env("HERDR_BIN_PATH", ws.herdr())
         .env("HERDR_WORKSPACE_ID", "w1")
         .env("HERDR_PANE_ID", "w1:p1")
         .env("HOME", &ws.dir)

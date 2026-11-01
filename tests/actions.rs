@@ -38,7 +38,7 @@ fn toggle_again_closes_the_pane_it_opened() {
 }
 
 #[test]
-fn open_leaves_an_open_pane_alone() {
+fn open_focuses_an_open_pane() {
     let ws = Workspace::new(|dir| {
         json!([
             shell("w1:p1", &dir.join("project")),
@@ -47,8 +47,9 @@ fn open_leaves_an_open_pane_alone() {
     });
     let output = ws.act("open");
     assert!(output.status.success());
-    assert_eq!(stdout(&output).trim(), "herdr-runner: already open (w1:p2)");
+    assert_eq!(stdout(&output).trim(), "herdr-runner: focused w1:p2");
     assert!(ws.calls_to(&["plugin", "pane", "open"]).is_empty());
+    assert_eq!(ws.calls_to(&["plugin", "pane", "focus"]), [["plugin", "pane", "focus", "w1:p2"]]);
 }
 
 #[test]
@@ -67,7 +68,7 @@ fn close_closes_every_runner_pane_in_the_workspace() {
         json!([
             shell("w1:p1", &project),
             runner("w1:p2", &project, &["/p/bin/herdr-runner"]),
-            runner("w1:p3", &project, &["herdr-runner"]),
+            runner("w1:p3", &project, &[r"C:\bin\herdr-runner.EXE"]),
         ])
     });
     let output = ws.act("close");

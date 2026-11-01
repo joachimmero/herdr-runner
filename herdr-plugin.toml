@@ -3,7 +3,7 @@ name = "herdr-runner"
 version = "0.1.0"
 # 0.9.0 resolves pane commands against the plugin root.
 min_herdr_version = "0.9.3"
-platforms = ["macos"]
+platforms = ["macos", "windows"]
 description = "Browse and run Unity Test Runner tests in the open Editor from a pane beside the chat."
 
 [[panes]]

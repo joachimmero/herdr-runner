@@ -16,7 +16,7 @@ tests in the Editor you already have open.
 
 ## Requirements
 
-- macOS, herdr 0.9.3 or later.
+- macOS or Windows, herdr 0.9.3 or later.
 - The [`unity` CLI](https://docs.unity.com) on `PATH` or in `~/.unity/bin`.
 - The project has the Pipeline package (`com.unity.pipeline`) installed and its Editor open.
 - `cargo`, to build the plugin. Install it with [rustup](https://rustup.rs); the first build
@@ -28,9 +28,11 @@ tests in the Editor you already have open.
 scripts/link.sh
 ```
 
-That builds the release binary with `cargo` (which must be on `PATH`), links `bin/herdr-runner`
-to it, and runs `herdr plugin link`.
-Then bind the toggle to a key in herdr's `config.toml`:
+On Windows, run it from Git Bash.
+
+That builds the release binary with `cargo`, puts it at `bin/herdr-runner` (`.exe` on Windows),
+puts `herdr-runner` on `PATH` through `~/.local/bin`, and runs `herdr plugin link`. On Windows
+it also adds that folder to the user PATH. Then bind the toggle to a key in herdr's `config.toml`:
 
 ```toml
 [[keys.command]]
@@ -101,4 +103,4 @@ cargo test
 ```
 
 The tests run the plugin against scripted stand-ins for the Editor (`tests/fakes/unity.py`) and
-for herdr (`tests/fakes/herdr.py`), so they need `python3` but no Editor.
+for herdr (`tests/fakes/herdr.py`), so they need `python3` (or `python`) but no Editor.

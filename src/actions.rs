@@ -55,7 +55,10 @@ fn act(action: Action) -> Result<String, String> {
             open.iter().try_for_each(|pane| herdr::call(&["pane", "close", pane]).map(drop))?;
             Ok(format!("closed {}", open.join(" ")))
         }
-        (Action::Open, false) => Ok(format!("already open ({})", open[0])),
+        (Action::Open, false) => {
+            herdr::call(&["plugin", "pane", "focus", &open[0]]).map(drop)?;
+            Ok(format!("focused {}", open[0]))
+        }
         (Action::Close, true) => Ok("nothing open".into()),
         (Action::Toggle | Action::Open, true) => {
             let (target, root) = placement(&ws, &context, &panes)?;
@@ -152,13 +155,19 @@ pub fn runs_runner(pane: &str) -> bool {
         let argv: Vec<&str> =
             process["argv"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let exe = text(process, "/argv0").or_else(|| argv.first().map(|exe| (*exe).to_owned()));
-        let named =
-            exe.is_some_and(|exe| Path::new(&exe).file_name().is_some_and(|name| name == BINARY));
+        let named = exe.is_some_and(|exe| is_runner_binary(Path::new(&exe)));
         named && !argv.contains(&"--action")
     })
 }
 
+fn is_runner_binary(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+        name.eq_ignore_ascii_case(BINARY) || name.eq_ignore_ascii_case(BINARY_EXE)
+    })
+}
+
 const BINARY: &str = env!("CARGO_PKG_NAME");
+const BINARY_EXE: &str = concat!(env!("CARGO_PKG_NAME"), ".exe");
 
 fn lock(ws: &str) -> Result<File, String> {
     let dir = herdr::state_dir()?;
@@ -182,4 +191,18 @@ fn text(value: &Value, pointer: &str) -> Option<String> {
         .and_then(Value::as_str)
         .filter(|text| !text.is_empty())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runner_binary_name_allows_exe() {
+        assert!(is_runner_binary(Path::new("herdr-runner")));
+        assert!(is_runner_binary(Path::new(r"C:\bin\herdr-runner.exe")));
+        assert!(is_runner_binary(Path::new(r"\\?\C:\bin\herdr-runner.EXE")));
+        assert!(!is_runner_binary(Path::new("herdr-runner.cmd")));
+        assert!(!is_runner_binary(Path::new("other")));
+    }
 }

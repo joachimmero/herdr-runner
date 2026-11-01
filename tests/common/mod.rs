@@ -2,15 +2,16 @@
 
 #![allow(dead_code)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::{Value, json};
 
 pub struct Workspace {
     pub dir: PathBuf,
+    herdr: PathBuf,
 }
 
 impl Workspace {
@@ -30,15 +31,16 @@ impl Workspace {
         std::fs::write(dir.join("state.json"), state.to_string()).unwrap();
 
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/herdr.py");
-        let herdr = dir.join("herdr");
-        std::fs::write(&herdr, format!("#!/bin/sh\nexec python3 '{}' \"$@\"\n", fake.display()))
-            .unwrap();
-        std::fs::set_permissions(&herdr, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { dir }
+        let herdr = write_python_shim(&dir.join("herdr"), &fake, &[]);
+        Self { dir, herdr }
     }
 
     pub fn project(&self) -> PathBuf {
         self.dir.join("project")
+    }
+
+    pub fn herdr(&self) -> &Path {
+        &self.herdr
     }
 
     /// Run `--action name` with the env herdr gives an action invoked from pane `w1:p1`.
@@ -51,7 +53,7 @@ impl Workspace {
         Command::new(env!("CARGO_BIN_EXE_herdr-runner"))
             .args(["--action", name])
             .env("FAKE_HERDR_DIR", &self.dir)
-            .env("HERDR_BIN_PATH", self.dir.join("herdr"))
+            .env("HERDR_BIN_PATH", &self.herdr)
             .env("HERDR_WORKSPACE_ID", "w1")
             .env("HERDR_PANE_ID", "w1:p1")
             .env("HERDR_PLUGIN_ID", "joachimmero.herdr-runner")
@@ -115,4 +117,65 @@ pub fn stderr(output: &Output) -> String {
 
 pub fn option<'a>(call: &'a [String], name: &str) -> Option<&'a str> {
     call.iter().position(|arg| arg == name).map(|at| call[at + 1].as_str())
+}
+
+fn python() -> &'static Path {
+    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
+    PYTHON.get_or_init(find_python)
+}
+
+fn find_python() -> PathBuf {
+    for candidate in python_candidates() {
+        let output =
+            Command::new(&candidate).args(["-c", "import sys; print(sys.executable)"]).output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    panic!("python3 or python is required to run the tests (see README)");
+}
+
+fn python_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        if let Ok(entries) = std::fs::read_dir(PathBuf::from(local).join("Programs").join("Python"))
+        {
+            for entry in entries.flatten() {
+                let python = entry.path().join("python.exe");
+                if python.is_file() {
+                    candidates.push(python);
+                }
+            }
+        }
+    }
+    candidates.push(PathBuf::from("python3"));
+    candidates.push(PathBuf::from("python"));
+    candidates
+}
+
+fn write_python_shim(dest: &Path, script: &Path, extras: &[&Path]) -> PathBuf {
+    #[cfg(windows)]
+    let dest = dest.with_extension("cmd");
+    #[cfg(unix)]
+    let dest = dest.to_path_buf();
+    let mut command = format!("\"{}\" \"{}\"", python().display(), script.display());
+    for extra in extras {
+        command.push_str(&format!(" \"{}\"", extra.display()));
+    }
+    #[cfg(windows)]
+    let body = format!("@echo off\r\n{command} %*\r\n");
+    #[cfg(unix)]
+    let body = format!("#!/bin/sh\nexec {command} \"$@\"\n");
+    std::fs::write(&dest, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dest
 }

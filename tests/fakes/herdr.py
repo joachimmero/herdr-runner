@@ -43,6 +43,8 @@ def main():
         panes.append({"pane_id": pane_id, "foreground_cwd": option(args, "--cwd"),
                       "argv0": "herdr-runner", "argv": ["/plugin/bin/herdr-runner"]})
         result = {"plugin_pane": {"pane": {"pane_id": pane_id, "tab_id": "w1:t1"}}}
+    elif args[:3] == ["plugin", "pane", "focus"]:
+        result = {}
     else:
         print(json.dumps({"error": {"code": "unknown_command"}}), file=sys.stderr)
         sys.exit(1)

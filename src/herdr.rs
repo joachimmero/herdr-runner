@@ -1,7 +1,7 @@
 //! The herdr CLI, which is the whole plugin API.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use serde_json::Value;
@@ -44,9 +44,13 @@ pub fn state_dir() -> Result<PathBuf, String> {
     }
     let state = var("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| var("HOME").map(|home| Path::new(&home).join(".local/state")))
-        .ok_or("no plugin state dir: neither HERDR_PLUGIN_STATE_DIR nor HOME is set")?;
+        .or_else(|| home().map(|home| home.join(".local/state")))
+        .ok_or("no plugin state dir: neither HERDR_PLUGIN_STATE_DIR nor a home directory is set")?;
     Ok(state.join("herdr/plugins").join(plugin_id()))
+}
+
+pub fn home() -> Option<PathBuf> {
+    var("HOME").or_else(|| var("USERPROFILE")).map(PathBuf::from)
 }
 
 /// `id` keeping only the characters a file name can safely hold; herdr ids contain `:`.

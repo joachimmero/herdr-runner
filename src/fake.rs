@@ -1,7 +1,8 @@
 //! A scripted Editor behind `tests/fakes/unity.py`, one per test so tests run in parallel.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use crate::unity::{Editor, Pace};
 
 pub struct FakeEditor {
     dir: PathBuf,
+    cli: PathBuf,
 }
 
 /// Fast enough that a test polling a few times stays well under a second.
@@ -37,12 +39,8 @@ impl FakeEditor {
         std::fs::write(dir.join("scenario.json"), scenario.to_string()).unwrap();
 
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fakes/unity.py");
-        let cli = dir.join("unity");
-        let script =
-            format!("#!/bin/sh\nexec python3 '{}' '{}' \"$@\"\n", fake.display(), dir.display());
-        std::fs::write(&cli, script).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Self { dir }
+        let cli = write_python_shim(&dir.join("unity"), &fake, &[dir.as_path()]);
+        Self { dir, cli }
     }
 
     pub fn project(&self) -> PathBuf {
@@ -50,7 +48,7 @@ impl FakeEditor {
     }
 
     pub fn editor(&self) -> Editor {
-        Editor::with_cli(self.project(), self.dir.join("unity"), PACE)
+        Editor::with_cli(self.project(), self.cli.clone(), PACE)
     }
 
     /// Every call the Editor received, oldest first.
@@ -80,6 +78,67 @@ impl Drop for FakeEditor {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+fn python() -> &'static Path {
+    static PYTHON: OnceLock<PathBuf> = OnceLock::new();
+    PYTHON.get_or_init(find_python)
+}
+
+fn find_python() -> PathBuf {
+    for candidate in python_candidates() {
+        let output =
+            Command::new(&candidate).args(["-c", "import sys; print(sys.executable)"]).output();
+        if let Ok(output) = output
+            && output.status.success()
+        {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
+        }
+    }
+    panic!("python3 or python is required to run the tests (see README)");
+}
+
+fn python_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        if let Ok(entries) = std::fs::read_dir(PathBuf::from(local).join("Programs").join("Python"))
+        {
+            for entry in entries.flatten() {
+                let python = entry.path().join("python.exe");
+                if python.is_file() {
+                    candidates.push(python);
+                }
+            }
+        }
+    }
+    candidates.push(PathBuf::from("python3"));
+    candidates.push(PathBuf::from("python"));
+    candidates
+}
+
+fn write_python_shim(dest: &Path, script: &Path, extras: &[&Path]) -> PathBuf {
+    #[cfg(windows)]
+    let dest = dest.with_extension("cmd");
+    #[cfg(unix)]
+    let dest = dest.to_path_buf();
+    let mut command = format!("\"{}\" \"{}\"", python().display(), script.display());
+    for extra in extras {
+        command.push_str(&format!(" \"{}\"", extra.display()));
+    }
+    #[cfg(windows)]
+    let body = format!("@echo off\r\n{command} %*\r\n");
+    #[cfg(unix)]
+    let body = format!("#!/bin/sh\nexec {command} \"$@\"\n");
+    std::fs::write(&dest, body).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    dest
 }
 
 /// A small suite: two fixtures, a failure with a stack trace, an explicit test, and a fixture
